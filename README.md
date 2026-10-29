@@ -33,7 +33,8 @@ Tested with Canon CR3 files. Other cameras' proxies may differ.
    sudo mv ~/Downloads/proxy-copy /usr/local/bin/
    ```
 
-The binary is signed with a Developer ID. If macOS still blocks it, clear the download
+The binary is signed with a Developer ID and notarized by Apple. If macOS still blocks it
+(for example, while offline on first run), clear the download
 flag:
 
 ```bash
