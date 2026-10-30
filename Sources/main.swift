@@ -13,22 +13,21 @@
 //   2. Quits Capture One, so it lets go of the camera and the session files.
 //   3. Scans the whole session folder for proxy CR3s.
 //   4. Lists the files on every camera attached by USB (and any --card folder) and
-//      matches each proxy to one by exact byte size and capture time.
+//      matches image ID and exact size, then verifies retained raw and metadata bytes.
 //   5. Downloads the matches one at a time, checks each is a full CR3 of exactly the
 //      proxy's size, backs the proxy up and puts the original in its place.
 //   6. Reopens the session in Capture One.
 //
-// Uses only what ships with macOS (ImageCaptureCore, SQLite, AppleScript), so the built
+// Uses only what ships with macOS (ImageCaptureCore, CryptoKit, AppleScript), so the built
 // binary runs on any Apple silicon Mac with nothing else installed.
 //
 // Build:
 //   swiftc -O -swift-version 5 -target arm64-apple-macos13 \
-//     -framework ImageCaptureCore -lsqlite3 proxy-copy.swift -o proxy-copy
+//     -framework ImageCaptureCore Sources/CR3.swift Sources/main.swift -o proxy-copy
 
 import AppKit
 import Foundation
 import ImageCaptureCore
-import SQLite3
 
 let usage = """
 usage: proxy-copy [SESSION_DIR_OR_CR3 ...] [--card FOLDER] [--dry]
@@ -38,11 +37,11 @@ Replaces Capture One wireless-tether proxy CR3s with the originals from the came
   (no paths)     use the session open in Capture One, then reopen it when done
   --card FOLDER  also take originals from this folder of CR3s (a card or volume)
   --dry          only list what would be replaced
+  --version      print version
 """
 
 let captureOne = "Capture One"
 let backupDirName = "_proxy_backup"
-let logFiles = ["CaptureOneCC-Previous.log", "CaptureOneCC.log"]
 let fm = FileManager.default
 
 // Lines go out in the order things happen, even when piped.
@@ -53,6 +52,21 @@ func fail(_ s: String) -> Never { warn(s); exit(1) }
 
 /// Spins the main run loop, which ImageCaptureCore delivers its callbacks on, until
 /// `done` is true or the timeout passes. Returns whether it finished in time.
+final class CallbackResult<Value> {
+    private let lock = NSLock()
+    private var stored: Value?
+    var value: Value? {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+    func set(_ value: Value) {
+        lock.lock()
+        defer { lock.unlock() }
+        stored = value
+    }
+}
+
 @discardableResult
 func wait(_ timeout: TimeInterval, until done: () -> Bool) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
@@ -170,56 +184,17 @@ func sessionRoot(_ url: URL) -> URL? {
     return nil
 }
 
-/// Image filename -> capture time (seconds since 1970), from the session database.
-func captureTimes(_ session: URL) -> [String: Double] {
-    let names = (try? fm.contentsOfDirectory(atPath: session.path)) ?? []
-    guard let db = names.first(where: { $0.hasSuffix(".cosessiondb") }) else { return [:] }
-    var handle: OpaquePointer?
-    guard sqlite3_open_v2(session.appendingPathComponent(db).path, &handle, SQLITE_OPEN_READONLY, nil) == SQLITE_OK
-    else { return [:] }
-    defer { sqlite3_close(handle) }
-    var stmt: OpaquePointer?
-    let sql = "select ZIMAGEFILENAME, ZEXP_DATE from ZIMAGE where ZEXP_DATE is not null and ZIMAGEFILENAME is not null"
-    guard sqlite3_prepare_v2(handle, sql, -1, &stmt, nil) == SQLITE_OK else { return [:] }
-    defer { sqlite3_finalize(stmt) }
-    var times: [String: Double] = [:]
-    while sqlite3_step(stmt) == SQLITE_ROW {
-        if let name = sqlite3_column_text(stmt, 0) {
-            times[String(cString: name)] = sqlite3_column_double(stmt, 1)
-        }
-    }
-    return times
-}
-
-/// Exact byte size -> camera filenames, from Capture One's tether logs.
-func loggedNames() -> [Int64: Set<String>] {
-    let logs = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs")
-    let re = try! NSRegularExpression(pattern: #"Received capture image \(size = (\d+), filename = "([^"]+)"\)"#)
-    var sizes: [Int64: Set<String>] = [:]
-    for name in logFiles {
-        guard let data = fm.contents(atPath: logs.appendingPathComponent(name).path) else { continue }
-        let text = String(decoding: data, as: UTF8.self)
-        for m in re.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
-            guard let s = Range(m.range(at: 1), in: text), let n = Range(m.range(at: 2), in: text),
-                  let size = Int64(text[s]) else { continue }
-            sizes[size, default: []].insert(String(text[n]))
-        }
-    }
-    return sizes
-}
-
 // MARK: Sources: cameras and card folders
 
 /// One original that could replace a proxy.
 final class Source {
     let name: String
     let size: Int64
-    let date: Date?
     let cameraFile: ICCameraFile?
     var local: URL?
 
-    init(name: String, size: Int64, date: Date?, cameraFile: ICCameraFile? = nil, local: URL? = nil) {
-        self.name = name; self.size = size; self.date = date; self.cameraFile = cameraFile; self.local = local
+    init(name: String, size: Int64, cameraFile: ICCameraFile? = nil, local: URL? = nil) {
+        self.name = name; self.size = size; self.cameraFile = cameraFile; self.local = local
     }
 }
 
@@ -259,25 +234,29 @@ final class Cameras: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDelegate {
         }
         return (device.mediaFiles ?? []).compactMap { $0 as? ICCameraFile }
             .filter { ($0.name ?? "").uppercased().hasSuffix(".CR3") }
-            .map { Source(name: $0.name!, size: Int64($0.fileSize), date: $0.creationDate, cameraFile: $0) }
+            .map { Source(name: $0.name!, size: Int64($0.fileSize), cameraFile: $0) }
     }
 
     func download(_ file: ICCameraFile, to dir: URL, timeout: TimeInterval = 300) -> Result<URL, Error> {
-        var result: Result<URL, Error>?
+        let answer = CallbackResult<Result<URL, Error>>()
+        let filename = UUID().uuidString + ".CR3"
         let options: [ICDownloadOption: Any] = [
             .downloadsDirectoryURL: dir as NSURL,
-            .saveAsFilename: file.name ?? "untitled",
-            .overwrite: true,
+            .saveAsFilename: filename,
+            .overwrite: false,
         ]
-        file.requestDownload(options: options) { name, error in
-            if let error { result = .failure(error) }
-            else { result = .success(dir.appendingPathComponent(name ?? file.name ?? "untitled")) }
+        let progress = file.requestDownload(options: options) { name, error in
+            if let error { answer.set(.failure(error)) }
+            else if let name, name != filename {
+                answer.set(.failure(RecoveryError.invalid("camera download returned an unexpected filename")))
+            } else { answer.set(.success(dir.appendingPathComponent(filename))) }
         }
-        guard wait(timeout, until: { result != nil }) else {
+        guard wait(timeout, until: { answer.value != nil }), let result = answer.value else {
+            progress?.cancel()
             return .failure(NSError(domain: "proxy-copy", code: 1,
                                     userInfo: [NSLocalizedDescriptionKey: "timed out after \(Int(timeout))s"]))
         }
-        return result!
+        return result
     }
 
     // ICDeviceBrowserDelegate
@@ -324,22 +303,11 @@ final class Cameras: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDelegate {
 
 func cardFiles(_ folder: URL) -> [Source] {
     cr3s(under: folder).filter { !isProxy($0) }.map { url in
-        let date = (try? fm.attributesOfItem(atPath: url.path)[.modificationDate]) as? Date
-        return Source(name: url.lastPathComponent, size: fileSize(url), date: date, local: url)
+        Source(name: url.lastPathComponent, size: fileSize(url), local: url)
     }
 }
 
 // MARK: Matching
-
-/// The camera writes its clock with no time zone, so the times it reports can sit a
-/// whole number of quarter hours off Capture One's. Returns that offset, or nil when
-/// the seconds do not line up at all.
-func zoneOffset(_ camera: Date, _ session: Double) -> Int? {
-    let diff = camera.timeIntervalSince1970 - session
-    let quarters = (diff / 900).rounded()
-    guard abs(diff - quarters * 900) <= 1, abs(quarters) <= 14 * 4 else { return nil }
-    return Int(quarters)
-}
 
 struct Plan {
     let proxy: URL
@@ -347,59 +315,62 @@ struct Plan {
     let how: String
 }
 
-/// Capture time first, then exact byte size. Two raws can be byte-for-byte the same
-/// size, so size alone (and the log, which is keyed on size) only narrows the field.
+func sourceFile(_ source: Source) throws -> CR3File {
+    if let local = source.local { return try CR3File(.local(local)) }
+    guard let camera = source.cameraFile, source.size > 0 else {
+        throw RecoveryError.invalid("original is unavailable")
+    }
+    let reader = CR3Reader(size: UInt64(source.size)) { offset, count in
+        guard offset <= UInt64(Int64.max) else { throw RecoveryError.invalid("camera offset is too large") }
+        let answer = CallbackResult<Result<Data, Error>>()
+        camera.requestReadData(atOffset: off_t(offset), length: off_t(count)) { data, error in
+            if let error { answer.set(.failure(error)) }
+            else if let data { answer.set(.success(data)) }
+            else { answer.set(.failure(RecoveryError.invalid("camera returned no data"))) }
+        }
+        guard wait(30, until: { answer.value != nil }), let result = answer.value else {
+            throw RecoveryError.invalid("camera range read timed out")
+        }
+        return try result.get()
+    }
+    return try CR3File(reader)
+}
+
+/// Inspect actual CR3 identity and retained content, including for USB camera objects.
+/// Duplicate verified candidates are refused rather than chosen by enumeration order.
 func match(_ proxies: [URL], _ sources: [Source]) -> (plan: [Plan], problems: [(URL, String)]) {
     let bySize = Dictionary(grouping: sources, by: \.size)
-    let logged = loggedNames()
-    var times: [URL: [String: Double]] = [:]
-    func time(of proxy: URL) -> Double? {
-        guard let root = sessionRoot(proxy) else { return nil }
-        if times[root] == nil { times[root] = captureTimes(root) }
-        return times[root]![proxy.lastPathComponent]
-    }
-
-    // Settle the camera's time-zone offset across every proxy at once, so a stray
-    // quarter-hour coincidence on one file cannot outvote the rest.
-    var votes: [Int: Int] = [:]
-    for p in proxies {
-        guard let t = time(of: p) else { continue }
-        for s in bySize[fileSize(p)] ?? [] {
-            if let d = s.date, let q = zoneOffset(d, t) { votes[q, default: 0] += 1 }
-        }
-    }
-    let offset = votes.max { $0.value < $1.value }?.key
-
-    var plan: [Plan] = [], problems: [(URL, String)] = []
-    for p in proxies {
-        let size = fileSize(p)
-        var fits = bySize[size] ?? []
-
-        if let t = time(of: p), let offset {
-            let timed = fits.filter { s in s.date.map { zoneOffset($0, t) == offset } ?? true }
-            let dated = timed.filter { $0.date != nil }
-            if dated.count == 1 { plan.append(Plan(proxy: p, source: dated[0], how: "capture time")); continue }
-            fits = timed
-        }
-        if let names = logged[size], names.count == 1 {
-            let hits = fits.filter { names.contains($0.name) }
-            if hits.count == 1 { plan.append(Plan(proxy: p, source: hits[0], how: "log")); continue }
-        }
-        if fits.count == 1, time(of: p) == nil {
-            plan.append(Plan(proxy: p, source: fits[0], how: "exact size")); continue
-        }
-        problems.append((p, "\(fits.count) originals of size \(size), none identified for certain"))
+    var inspected: [ObjectIdentifier: Result<CR3File, Error>] = [:]
+    var plan: [Plan] = []
+    var problems: [(URL, String)] = []
+    for path in proxies {
+        do {
+            let proxy = try CR3File(.local(path))
+            var verified: [(source: Source, how: String, byID: Bool)] = []
+            var lastProblem = "no original of matching size"
+            for source in bySize[fileSize(path)] ?? [] {
+                do {
+                    let key = ObjectIdentifier(source)
+                    let result = inspected[key] ?? Result { try sourceFile(source) }
+                    inspected[key] = result
+                    let original = try result.get()
+                    let how = try verifyIdentity(proxy, original)
+                    verified.append((source, how, proxy.imageID != nil && original.imageID != nil))
+                } catch { lastProblem = error.localizedDescription }
+            }
+            let primary = verified.filter { $0.byID }
+            let fits = primary.isEmpty ? verified : primary
+            if fits.count == 1, let candidate = fits.first {
+                plan.append(Plan(proxy: path, source: candidate.source, how: candidate.how))
+            } else {
+                problems.append((path, fits.isEmpty ? lastProblem : "multiple originals pass verification; match is ambiguous"))
+            }
+        } catch { problems.append((path, error.localizedDescription)) }
     }
     return (plan, problems)
 }
 
-// MARK: Replacing
-
 func replace(_ proxy: URL, with original: URL, session: URL?) -> String? {
-    guard fm.fileExists(atPath: original.path) else { return "not downloaded" }
-    guard fileSize(original) == fileSize(proxy), !isProxy(original) else {
-        return "downloaded file does not match the proxy's size, or is itself a proxy"
-    }
     let backup: URL
     if let session, proxy.path.hasPrefix(session.path + "/") {
         let rel = String(proxy.path.dropFirst(session.path.count + 1))
@@ -409,21 +380,9 @@ func replace(_ proxy: URL, with original: URL, session: URL?) -> String? {
             .appendingPathComponent(proxy.lastPathComponent)
     }
     do {
-        try fm.createDirectory(at: backup.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if !fm.fileExists(atPath: backup.path) { try fm.copyItem(at: proxy, to: backup) }
-        // Copy to a temp file then swap, so nothing ever sees a half-written raw.
-        let tmp = proxy.deletingLastPathComponent().appendingPathComponent(".\(proxy.lastPathComponent).proxycopy")
-        try? fm.removeItem(at: tmp)
-        try fm.copyItem(at: original, to: tmp)
-        guard fileSize(tmp) == fileSize(proxy), !isProxy(tmp) else {
-            try? fm.removeItem(at: tmp)
-            return "copy did not verify"
-        }
-        _ = try fm.replaceItemAt(proxy, withItemAt: tmp)
-    } catch {
-        return error.localizedDescription
-    }
-    return nil
+        try replaceVerified(proxy, original: original, backupRoot: backup)
+        return nil
+    } catch { return error.localizedDescription }
 }
 
 // MARK: Main
@@ -434,6 +393,7 @@ var dry = false
 var argv = CommandLine.arguments.dropFirst()
 while let a = argv.popFirst() {
     switch a {
+    case "--version": print("proxy-copy 1.1.0"); exit(0)
     case "--dry": dry = true
     case "--card":
         guard let path = argv.popFirst() else { fail("--card needs a folder.\n\n" + usage) }
@@ -454,7 +414,7 @@ if targets.isEmpty {
     print("Session: \(session.folder.path)")
 }
 
-if captureOneRunning(includingHelpers: true) {
+if !dry, captureOneRunning(includingHelpers: true) {
     print("Quitting \(captureOne)…")
     quitCaptureOne()
 }
@@ -469,7 +429,7 @@ func fix() -> Int32 {
     let cameras = Cameras()
     defer { cameras.stop() }
     var sources: [Source] = []
-    let attached = cameras.find()
+    let attached = dry && captureOneRunning(includingHelpers: true) ? [] : cameras.find()
     for device in attached {
         if let files = cameras.files(on: device) {
             print("Camera: \(device.name ?? "camera"), \(files.count) CR3(s)")
@@ -501,11 +461,12 @@ func fix() -> Int32 {
 
     if dry {
         print("\nDry run: \(plan.count) to replace, \(problems.count) not found. Run without --dry to replace.")
-        return 0
+        return problems.isEmpty ? 0 : 1
     }
 
     let work = fm.temporaryDirectory.appendingPathComponent("proxy-copy-\(UUID().uuidString)")
-    try? fm.createDirectory(at: work, withIntermediateDirectories: true)
+    do { try fm.createDirectory(at: work, withIntermediateDirectories: true) }
+    catch { warn("Could not create download folder: \(error.localizedDescription)"); return 1 }
     defer { try? fm.removeItem(at: work) }
 
     var failed = 0
@@ -531,10 +492,10 @@ func fix() -> Int32 {
     let replaced = plan.count - failed
     print("\n\(replaced) replaced, \(failed) failed, \(problems.count) not found."
           + (replaced > 0 ? " Proxies backed up to \(backupDirName)/." : ""))
-    return failed > 0 ? 1 : 0
+    return failed > 0 || !problems.isEmpty ? 1 : 0
 }
 
 // Whatever happens in between, put the session back the way it was found.
 let status = fix()
-if let sessionFile { reopen(sessionFile) }
+if !dry, let sessionFile { reopen(sessionFile) }
 exit(status)
